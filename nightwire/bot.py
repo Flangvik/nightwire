@@ -1324,9 +1324,14 @@ Return ONLY valid JSON, no markdown code blocks, no explanation."""
                         break
 
             if response is None and (self._is_nightwire_query(message) or source_voice):
-                # Addressed to nightwire (explicit prefix or voice message)
-                # The agentic loop handles tool calling and command execution internally.
-                response = await self._nightwire_response(message, sender=sender, source_voice=source_voice)
+                # Addressed to nightwire (explicit prefix or voice message).
+                # Run as a background task so the websocket handler returns immediately.
+                # This is critical because:
+                # 1. The agentic loop may use ask_user which waits for a reply
+                #    (up to 5 min), exceeding the 120s message handler timeout.
+                # 2. The websocket must stay free to receive the user's reply.
+                self._start_nightwire_task(sender, message, source_voice)
+                return  # Response will be sent when the agentic loop finishes
             elif response is None:
                 # Treat non-command messages as /do commands if a project is selected
                 if self.cooldown_manager and self.cooldown_manager.is_active:
@@ -1379,6 +1384,42 @@ Return ONLY valid JSON, no markdown code blocks, no explanation."""
         if msg_lower in ("nightwire", "sidechannel"):
             return True
         return False
+
+    def _start_nightwire_task(self, sender: str, message: str, source_voice: bool = False):
+        """Spawn the nightwire agentic loop as a background asyncio task.
+
+        This prevents the websocket message handler from blocking (which has
+        a 120s timeout), and allows the loop to use ask_user which can wait
+        up to 5 minutes for a reply.
+        """
+        async def _run():
+            try:
+                response = await self._nightwire_response(message, sender=sender, source_voice=source_voice)
+                if response:
+                    # Store outgoing response
+                    project_name = self.project_manager.get_current_project(sender)
+                    t = asyncio.create_task(
+                        self.memory.store_message(
+                            phone_number=sender,
+                            role="assistant",
+                            content=response,
+                            project_name=project_name,
+                            command_type=None,
+                        )
+                    )
+                    t.add_done_callback(_log_task_exception)
+                    await self._send_message(sender, response)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("nightwire_task_error", error=str(e), exc_type=type(e).__name__)
+                try:
+                    await self._send_message(sender, "The assistant encountered an error. Please try again.")
+                except Exception:
+                    pass
+
+        task = asyncio.create_task(_run())
+        task.add_done_callback(_log_task_exception)
 
     async def _nightwire_response(self, message: str, sender: str = "", source_voice: bool = False) -> str:
         """Generate a nightwire response using the agentic tool-calling loop."""
